@@ -49,8 +49,7 @@ def request_with_retry(method, url, retries=MAX_RETRIES, **kwargs):
     kwargs.setdefault('timeout', REQUEST_TIMEOUT)
     for attempt in range(1, retries + 1):
         try:
-            response = requests.request(method, url, **kwargs)
-            return response
+            return requests.request(method, url, **kwargs)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             print(f"  Attempt {attempt}/{retries} failed: {e}")
             if attempt == retries:
@@ -92,8 +91,8 @@ class ZohoInventoryClient:
             'Content-Type': 'application/json'
         }
 
-    def get_items(self):
-        url = f"{self.config['api_domain']}/inventory/v1/items"
+    def get_all_pages(self, url, key):
+        """Generic paginated fetcher."""
         all_data = []
         page = 1
         while True:
@@ -102,27 +101,38 @@ class ZohoInventoryClient:
             if response.status_code == 200:
                 data = response.json()
                 if data.get('code') == 0:
-                    items = data.get('items', [])
+                    items = data.get(key, [])
                     if not items:
                         break
                     all_data.extend(items)
-                    print(f"   Page {page}: {len(items)} items fetched")
+                    print(f"   Page {page}: {len(items)} records")
                     if not data.get('page_context', {}).get('has_more_page', False):
                         break
                     page += 1
                 elif data.get('code') == 45:
-                    print(f"🚫 Rate limit hit. Returning {len(all_data)} items.")
+                    print(f"🚫 Rate limit. Returning {len(all_data)} records.")
                     break
                 else:
                     print(f"❌ API Error: {data.get('message')}")
                     break
             elif response.status_code == 429:
-                print(f"🚫 HTTP 429. Returning {len(all_data)} items.")
+                print(f"🚫 HTTP 429. Returning {len(all_data)} records.")
                 break
             else:
                 print(f"❌ Request failed: {response.status_code}")
                 break
         return all_data
+
+    def get_items(self):
+        print("Fetching items...")
+        url = f"{self.config['api_domain']}/inventory/v1/items"
+        return self.get_all_pages(url, 'items')
+
+    def get_inventory_summary(self):
+        """Fetch inventory summary which includes stock quantities."""
+        print("Fetching inventory summary (stock levels)...")
+        url = f"{self.config['api_domain']}/inventory/v1/inventorysummary"
+        return self.get_all_pages(url, 'inventory_summary')
 
 # ============================================================
 # GOOGLE SHEETS CLIENT
@@ -156,7 +166,6 @@ class GoogleSheetsClient:
         if not isinstance(data, pd.DataFrame):
             print("Data must be a DataFrame")
             return False
-        # Replace NaN/inf with empty string to avoid JSON errors
         data = data.fillna('').replace([float('inf'), float('-inf')], '')
         data = data.astype(str).replace('nan', '').replace('None', '')
         values = [data.columns.tolist()] + data.values.tolist()
@@ -186,38 +195,37 @@ def main():
 
     sheets_client = GoogleSheetsClient(GOOGLE_CONFIG)
 
-    print("\nFetching items from Zoho Inventory...")
-    data = zoho_client.get_items()
-    if not data:
-        print("❌ No data fetched")
-        raise SystemExit(1)
+    # Fetch inventory summary (has stock quantities)
+    summary_data = zoho_client.get_inventory_summary()
 
-    df = pd.DataFrame(data)
-    print(f"\nTotal records fetched: {len(df)}")
+    if summary_data:
+        print(f"\nInventory summary records: {len(summary_data)}")
+        df = pd.DataFrame(summary_data)
+        print(f"Summary columns: {list(df.columns)}")
 
-    # Print available columns for debugging
-    print(f"Available columns: {list(df.columns)}")
-
-    # Preferred columns in order — use whatever is available
-    desired = ['sku', 'item_name', 'stock_on_hand', 'available_stock',
-               'actual_available_stock', 'reorder_level']
-    cols = [c for c in desired if c in df.columns]
-    if not cols:
-        # Fallback: just use all columns
-        print("⚠️  None of the desired columns found, writing all columns")
-    else:
-        missing = [c for c in desired if c not in df.columns]
-        if missing:
-            print(f"⚠️  Skipping missing columns: {missing}")
+        # Keep useful columns
+        keep = ['sku', 'item_name', 'item_id', 'stock_on_hand',
+                'available_stock', 'actual_available_stock',
+                'committed_stock', 'available_for_sale', 'reorder_level']
+        cols = [c for c in keep if c in df.columns]
         df = df[cols]
 
-    # Filter rows where any stock column > 0
-    stock_col = next((c for c in ['stock_on_hand', 'available_stock'] if c in df.columns), None)
-    if stock_col:
-        df = df[pd.to_numeric(df[stock_col], errors='coerce').fillna(0) > 0]
-        print(f"Records with {stock_col} > 0: {len(df)}")
+        # Filter stock > 0
+        stock_col = next((c for c in ['stock_on_hand', 'available_stock', 'available_for_sale'] if c in df.columns), None)
+        if stock_col:
+            df = df[pd.to_numeric(df[stock_col], errors='coerce').fillna(0) > 0]
+            print(f"Records with {stock_col} > 0: {len(df)}")
+    else:
+        # Fallback: use items endpoint with all columns
+        print("\n⚠️  No inventory summary data, falling back to items endpoint")
+        items_data = zoho_client.get_items()
+        if not items_data:
+            print("❌ No data fetched")
+            raise SystemExit(1)
+        df = pd.DataFrame(items_data)
+        keep = ['sku', 'item_name', 'reorder_level']
+        df = df[[c for c in keep if c in df.columns]]
 
-    # Add IST timestamp
     ist = timezone(timedelta(hours=5, minutes=30))
     df['sync_timestamp'] = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
