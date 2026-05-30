@@ -77,58 +77,68 @@ class ZohoInventoryClient:
     def get_headers(self):
         return {'Authorization': f'Zoho-oauthtoken {self.access_token}'}
 
-    def get_all_pages(self, url, key, extra_params=None):
+    def get_items(self):
+        """Fetch all items (basic info: sku, item_name, reorder_level, item_id)."""
+        url = f"{self.config['api_domain']}/inventory/v1/items"
         all_data = []
         page = 1
         while True:
             params = {'organization_id': self.config['organization_id'], 'page': page}
-            if extra_params:
-                params.update(extra_params)
             r = request_with_retry('get', url, headers=self.get_headers(), params=params)
             if r.status_code != 200:
-                print(f"❌ HTTP {r.status_code}: {r.text[:300]}")
+                print(f"❌ HTTP {r.status_code}")
                 break
             data = r.json()
             if data.get('code') != 0:
-                print(f"❌ API error {data.get('code')}: {data.get('message')}")
+                print(f"❌ API error: {data.get('message')}")
                 break
-            items = data.get(key, [])
+            items = data.get('items', [])
             if not items:
                 break
             all_data.extend(items)
-            print(f"   Page {page}: {len(items)} records")
+            print(f"   Page {page}: {len(items)} items")
             if not data.get('page_context', {}).get('has_more_page', False):
                 break
             page += 1
         return all_data
 
-    def get_report_keys(self):
-        """Fetch first page of reports/inventorysummary and print all keys."""
+    def get_inventory_report(self):
+        """
+        Fetch reports/inventorysummary.
+        Each page returns 1 record with key 'inventory' containing
+        a dict with key 'item_details' — a list of warehouse stock rows.
+        We flatten all item_details across all pages.
+        """
         url = f"{self.config['api_domain']}/inventory/v1/reports/inventorysummary"
-        params = {'organization_id': self.config['organization_id'], 'page': 1}
-        r = request_with_retry('get', url, headers=self.get_headers(), params=params)
-        print(f"\n--- reports/inventorysummary response ---")
-        print(f"Status: {r.status_code}")
-        try:
-            body = r.json()
-            print(f"Top-level keys: {list(body.keys())}")
-            for k, v in body.items():
-                if isinstance(v, list) and v:
-                    print(f"  '{k}' is a list with {len(v)} items. First item keys: {list(v[0].keys())}")
-                    return k, v  # return key name and first page data
-                elif isinstance(v, list):
-                    print(f"  '{k}' is an empty list")
-                else:
-                    print(f"  '{k}': {str(v)[:100]}")
-        except Exception as e:
-            print(f"Could not parse JSON: {e}")
-            print(r.text[:500])
-        print("--- end ---\n")
-        return None, []
+        all_details = []
+        page = 1
+        while True:
+            params = {'organization_id': self.config['organization_id'], 'page': page}
+            r = request_with_retry('get', url, headers=self.get_headers(), params=params)
+            if r.status_code != 200:
+                print(f"❌ HTTP {r.status_code}")
+                break
+            data = r.json()
+            if data.get('code') != 0:
+                print(f"❌ API error: {data.get('message')}")
+                break
+            inventory = data.get('inventory', [])
+            if not inventory:
+                break
+            # Each element in 'inventory' has an 'item_details' list
+            for record in inventory:
+                item_details = record.get('item_details', [])
+                if item_details:
+                    all_details.extend(item_details)
+            print(f"   Page {page}: {len(inventory)} group(s), "
+                  f"{sum(len(r.get('item_details',[])) for r in inventory)} item_details")
+            if not data.get('page_context', {}).get('has_more_page', False):
+                break
+            page += 1
 
-    def get_items(self):
-        url = f"{self.config['api_domain']}/inventory/v1/items"
-        return self.get_all_pages(url, 'items')
+        if all_details:
+            print(f"Sample item_details keys: {list(all_details[0].keys())}")
+        return all_details
 
 
 class GoogleSheetsClient:
@@ -183,56 +193,65 @@ def main():
 
     sheets_client = GoogleSheetsClient(GOOGLE_CONFIG)
 
-    # Step 1: Inspect the reports endpoint to find the right key + columns
-    report_key, _ = zoho_client.get_report_keys()
-
-    # Step 2: Fetch items (always works) and merge with report data if available
+    # --- Fetch items for sku, item_name, reorder_level ---
     print("\nFetching items...")
     items_data = zoho_client.get_items()
     if not items_data:
         print("❌ No items fetched")
         raise SystemExit(1)
-
-    df_items = pd.DataFrame(items_data)
+    df_items = pd.DataFrame(items_data)[['item_id', 'sku', 'item_name', 'reorder_level']]
     print(f"Items fetched: {len(df_items)}")
 
-    # Step 3: If report endpoint has a valid key, fetch stock from there and merge
-    if report_key:
-        print(f"\nFetching report data (key='{report_key}')...")
-        url = f"{zoho_client.config['api_domain']}/inventory/v1/reports/inventorysummary"
-        report_data = zoho_client.get_all_pages(url, report_key)
-        if report_data:
-            df_report = pd.DataFrame(report_data)
-            print(f"Report records: {len(df_report)}")
-            print(f"Report columns: {list(df_report.columns)}")
-            # Merge on item_id or sku
-            merge_col = 'item_id' if 'item_id' in df_report.columns else 'sku'
-            if merge_col in df_items.columns and merge_col in df_report.columns:
-                stock_cols = [c for c in df_report.columns if any(x in c for x in
-                    ['stock', 'available', 'committed', 'reorder'])]
-                keep = [merge_col] + stock_cols
-                df_report = df_report[[c for c in keep if c in df_report.columns]]
-                df_items = df_items.merge(df_report, on=merge_col, how='left')
-                print(f"Merged. Stock columns added: {stock_cols}")
+    # --- Fetch inventory report for stock quantities ---
+    print("\nFetching inventory report (stock levels)...")
+    report_data = zoho_client.get_inventory_report()
 
-    # Step 4: Select final columns
-    priority = ['sku', 'item_name', 'stock_on_hand', 'available_stock',
-                'actual_available_stock', 'available_for_sale',
-                'committed_stock', 'reorder_level']
-    cols = [c for c in priority if c in df_items.columns]
-    print(f"\nFinal columns: {cols}")
-    df = df_items[cols]
+    if report_data:
+        df_report = pd.DataFrame(report_data)
+        print(f"Report rows: {len(df_report)}")
+        print(f"Report columns: {list(df_report.columns)}")
 
-    # Filter by stock > 0
-    stock_col = next((c for c in ['stock_on_hand', 'available_stock', 'available_for_sale']
-                      if c in df.columns), None)
+        # Pick stock columns that exist
+        stock_cols = [c for c in df_report.columns if any(x in c.lower() for x in
+                      ['stock', 'available', 'committed', 'quantity', 'on_hand'])]
+        print(f"Stock columns found: {stock_cols}")
+
+        # Find merge key
+        merge_col = next((c for c in ['item_id', 'sku'] if c in df_report.columns and c in df_items.columns), None)
+        if merge_col:
+            keep_cols = [merge_col] + [c for c in stock_cols if c in df_report.columns]
+            # If multiple rows per item (one per warehouse), aggregate by sum
+            df_stock = df_report[keep_cols].copy()
+            for col in stock_cols:
+                if col in df_stock.columns:
+                    df_stock[col] = pd.to_numeric(df_stock[col], errors='coerce').fillna(0)
+            df_stock = df_stock.groupby(merge_col, as_index=False).sum()
+            df = df_items.merge(df_stock, on=merge_col, how='left')
+            print(f"Merged on '{merge_col}'. Final shape: {df.shape}")
+        else:
+            print("⚠️  No common merge column found between items and report")
+            df = df_items
+    else:
+        print("⚠️  No report data — showing items only")
+        df = df_items
+
+    # --- Filter by stock > 0 if stock column available ---
+    stock_col = next((c for c in ['stock_on_hand', 'available_stock', 'quantity_on_hand',
+                                   'available_for_sale'] if c in df.columns), None)
     if stock_col:
         df = df[pd.to_numeric(df[stock_col], errors='coerce').fillna(0) > 0]
         print(f"After filter ({stock_col} > 0): {len(df)} records")
+    else:
+        print("⚠️  No stock column to filter on — writing all records")
+
+    # Drop internal item_id column from output
+    if 'item_id' in df.columns:
+        df = df.drop(columns=['item_id'])
 
     ist = timezone(timedelta(hours=5, minutes=30))
     df['sync_timestamp'] = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
+    print(f"\nFinal columns: {list(df.columns)}")
     print("\nWriting to Google Sheets...")
     sheets_client.clear_sheet()
     success = sheets_client.update_sheet(df)
