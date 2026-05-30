@@ -125,7 +125,7 @@ class ZohoInventoryClient:
 
     def get_items(self):
         print("Fetching items...")
-        url = f"{self.config['api_domain']}/inventory/v1/items"
+        url = f"{self.config['api_domain']}/inventory/v1/reports/inventorysummary"
         return self.get_all_pages(url, 'items')
 
     def get_inventory_summary(self):
