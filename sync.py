@@ -28,7 +28,7 @@ if _sa_key_env:
         'credentials_info': _sa_info,  # dict, used directly
         'credentials_file': None,
         'spreadsheet_id': os.environ['GOOGLE_SPREADSHEET_ID'],
-        'sheet_name': 'Inventory_Stock'
+        'sheet_name': 'inventory-stock'
     }
 else:
     GOOGLE_CONFIG = {
@@ -40,7 +40,7 @@ else:
 
 EXPORT_COLUMNS = [
     'sku', 'item_name',
-    'available_stock', 'actual_available_stock', 'reorder_level'
+    'stock_on_hand', 'available_stock', 'actual_available_stock', 'reorder_level'
 ]
 
 MAX_RETRIES = 3
