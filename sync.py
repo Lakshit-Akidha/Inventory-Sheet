@@ -77,38 +77,7 @@ class ZohoInventoryClient:
     def get_headers(self):
         return {'Authorization': f'Zoho-oauthtoken {self.access_token}'}
 
-    def get_items(self):
-        """Fetch all items (basic info: sku, item_name, reorder_level, item_id)."""
-        url = f"{self.config['api_domain']}/inventory/v1/items"
-        all_data = []
-        page = 1
-        while True:
-            params = {'organization_id': self.config['organization_id'], 'page': page}
-            r = request_with_retry('get', url, headers=self.get_headers(), params=params)
-            if r.status_code != 200:
-                print(f"❌ HTTP {r.status_code}")
-                break
-            data = r.json()
-            if data.get('code') != 0:
-                print(f"❌ API error: {data.get('message')}")
-                break
-            items = data.get('items', [])
-            if not items:
-                break
-            all_data.extend(items)
-            print(f"   Page {page}: {len(items)} items")
-            if not data.get('page_context', {}).get('has_more_page', False):
-                break
-            page += 1
-        return all_data
-
     def get_inventory_report(self):
-        """
-        Fetch reports/inventorysummary.
-        Each page returns 1 record with key 'inventory' containing
-        a dict with key 'item_details' — a list of warehouse stock rows.
-        We flatten all item_details across all pages.
-        """
         url = f"{self.config['api_domain']}/inventory/v1/reports/inventorysummary"
         all_details = []
         page = 1
@@ -125,19 +94,12 @@ class ZohoInventoryClient:
             inventory = data.get('inventory', [])
             if not inventory:
                 break
-            # Each element in 'inventory' has an 'item_details' list
             for record in inventory:
-                item_details = record.get('item_details', [])
-                if item_details:
-                    all_details.extend(item_details)
-            print(f"   Page {page}: {len(inventory)} group(s), "
-                  f"{sum(len(r.get('item_details',[])) for r in inventory)} item_details")
+                all_details.extend(record.get('item_details', []))
+            print(f"   Page {page}: {sum(len(r.get('item_details',[])) for r in inventory)} items")
             if not data.get('page_context', {}).get('has_more_page', False):
                 break
             page += 1
-
-        if all_details:
-            print(f"Sample item_details keys: {list(all_details[0].keys())}")
         return all_details
 
 
@@ -193,65 +155,35 @@ def main():
 
     sheets_client = GoogleSheetsClient(GOOGLE_CONFIG)
 
-    # --- Fetch items for sku, item_name, reorder_level ---
-    print("\nFetching items...")
-    items_data = zoho_client.get_items()
-    if not items_data:
-        print("❌ No items fetched")
-        raise SystemExit(1)
-    df_items = pd.DataFrame(items_data)[['item_id', 'sku', 'item_name', 'reorder_level']]
-    print(f"Items fetched: {len(df_items)}")
-
-    # --- Fetch inventory report for stock quantities ---
-    print("\nFetching inventory report (stock levels)...")
+    print("\nFetching inventory data...")
     report_data = zoho_client.get_inventory_report()
+    if not report_data:
+        print("❌ No data fetched")
+        raise SystemExit(1)
 
-    if report_data:
-        df_report = pd.DataFrame(report_data)
-        print(f"Report rows: {len(df_report)}")
-        print(f"Report columns: {list(df_report.columns)}")
+    df = pd.DataFrame(report_data)
+    print(f"Total records: {len(df)}")
 
-        # Pick stock columns that exist
-        stock_cols = [c for c in df_report.columns if any(x in c.lower() for x in
-                      ['stock', 'available', 'committed', 'quantity', 'on_hand'])]
-        print(f"Stock columns found: {stock_cols}")
+    # Rename to match the original sheet format exactly
+    df = df.rename(columns={
+        'quantity_available': 'available_stock',
+        'quantity_available_for_sale': 'actual_available_stock'
+    })
 
-        # Find merge key
-        merge_col = next((c for c in ['item_id', 'sku'] if c in df_report.columns and c in df_items.columns), None)
-        if merge_col:
-            keep_cols = [merge_col] + [c for c in stock_cols if c in df_report.columns]
-            # If multiple rows per item (one per warehouse), aggregate by sum
-            df_stock = df_report[keep_cols].copy()
-            for col in stock_cols:
-                if col in df_stock.columns:
-                    df_stock[col] = pd.to_numeric(df_stock[col], errors='coerce').fillna(0)
-            df_stock = df_stock.groupby(merge_col, as_index=False).sum()
-            df = df_items.merge(df_stock, on=merge_col, how='left')
-            print(f"Merged on '{merge_col}'. Final shape: {df.shape}")
-        else:
-            print("⚠️  No common merge column found between items and report")
-            df = df_items
-    else:
-        print("⚠️  No report data — showing items only")
-        df = df_items
+    # Select and order columns to match original format:
+    # sku | item_name | available_stock | actual_available_stock | reorder_level | sync_timestamp
+    final_cols = ['sku', 'item_name', 'available_stock', 'actual_available_stock', 'reorder_level']
+    df = df[[c for c in final_cols if c in df.columns]]
 
-    # --- Filter by stock > 0 if stock column available ---
-    stock_col = next((c for c in ['stock_on_hand', 'available_stock', 'quantity_on_hand',
-                                   'available_for_sale'] if c in df.columns), None)
-    if stock_col:
-        df = df[pd.to_numeric(df[stock_col], errors='coerce').fillna(0) > 0]
-        print(f"After filter ({stock_col} > 0): {len(df)} records")
-    else:
-        print("⚠️  No stock column to filter on — writing all records")
+    # Filter: only rows where available_stock > 0
+    df['available_stock'] = pd.to_numeric(df['available_stock'], errors='coerce').fillna(0)
+    df = df[df['available_stock'] > 0]
+    print(f"Records with available_stock > 0: {len(df)}")
 
-    # Drop internal item_id column from output
-    if 'item_id' in df.columns:
-        df = df.drop(columns=['item_id'])
-
+    # Add IST timestamp
     ist = timezone(timedelta(hours=5, minutes=30))
     df['sync_timestamp'] = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
-    print(f"\nFinal columns: {list(df.columns)}")
     print("\nWriting to Google Sheets...")
     sheets_client.clear_sheet()
     success = sheets_client.update_sheet(df)
