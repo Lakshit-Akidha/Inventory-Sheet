@@ -91,12 +91,37 @@ class ZohoInventoryClient:
             'Content-Type': 'application/json'
         }
 
-    def get_all_pages(self, url, key):
-        """Generic paginated fetcher."""
+    def probe_endpoints(self):
+        """Test multiple endpoints and print what works."""
+        org = self.config['organization_id']
+        base = self.config['api_domain']
+        endpoints = [
+            (f"{base}/inventory/v1/items", 'items'),
+            (f"{base}/inventory/v1/items?filter_by=Status.Active", 'items'),
+            (f"{base}/inventory/v1/inventorysummary", 'inventory_summary'),
+            (f"{base}/inventory/v1/reports/inventorysummary", None),
+            (f"{base}/inventory/v1/warehouses", 'warehouses'),
+        ]
+        print("\n--- Probing Zoho endpoints ---")
+        for url, key in endpoints:
+            r = requests.get(url, headers=self.get_headers(),
+                           params={'organization_id': org, 'page': 1},
+                           timeout=15)
+            body = r.json() if r.headers.get('content-type','').startswith('application/json') else {}
+            code = body.get('code', 'N/A')
+            count = len(body.get(key, [])) if key else '?'
+            print(f"  {r.status_code} code={code} count={count}  {url.replace(base,'')}")
+            if r.status_code == 200 and code == 0 and key and body.get(key):
+                print(f"    Sample keys: {list(body[key][0].keys())[:10]}")
+        print("--- End probe ---\n")
+
+    def get_all_pages(self, url, key, extra_params=None):
         all_data = []
         page = 1
         while True:
             params = {'organization_id': self.config['organization_id'], 'page': page}
+            if extra_params:
+                params.update(extra_params)
             response = request_with_retry('get', url, headers=self.get_headers(), params=params)
             if response.status_code == 200:
                 data = response.json()
@@ -110,29 +135,20 @@ class ZohoInventoryClient:
                         break
                     page += 1
                 elif data.get('code') == 45:
-                    print(f"🚫 Rate limit. Returning {len(all_data)} records.")
+                    print(f"🚫 Rate limit. Got {len(all_data)} so far.")
                     break
                 else:
-                    print(f"❌ API Error: {data.get('message')}")
+                    print(f"❌ API Error code={data.get('code')}: {data.get('message')}")
                     break
-            elif response.status_code == 429:
-                print(f"🚫 HTTP 429. Returning {len(all_data)} records.")
-                break
             else:
-                print(f"❌ Request failed: {response.status_code}")
+                print(f"❌ HTTP {response.status_code}: {response.text[:200]}")
                 break
         return all_data
 
     def get_items(self):
-        print("Fetching items...")
-        url = f"{self.config['api_domain']}/inventory/v1/reports/inventorysummary"
+        print("Fetching items from Zoho...")
+        url = f"{self.config['api_domain']}/inventory/v1/items"
         return self.get_all_pages(url, 'items')
-
-    def get_inventory_summary(self):
-        """Fetch inventory summary which includes stock quantities."""
-        print("Fetching inventory summary (stock levels)...")
-        url = f"{self.config['api_domain']}/inventory/v1/inventorysummary"
-        return self.get_all_pages(url, 'inventory_summary')
 
 # ============================================================
 # GOOGLE SHEETS CLIENT
@@ -164,17 +180,15 @@ class GoogleSheetsClient:
     def update_sheet(self, data, sheet_name=None):
         sheet_name = sheet_name or self.config['sheet_name']
         if not isinstance(data, pd.DataFrame):
-            print("Data must be a DataFrame")
             return False
         data = data.fillna('').replace([float('inf'), float('-inf')], '')
         data = data.astype(str).replace('nan', '').replace('None', '')
         values = [data.columns.tolist()] + data.values.tolist()
-        body = {'values': values}
         result = self.service.spreadsheets().values().update(
             spreadsheetId=self.config['spreadsheet_id'],
             range=f"'{sheet_name}'!A1",
             valueInputOption='USER_ENTERED',
-            body=body
+            body={'values': values}
         ).execute()
         print(f"✅ Updated {result.get('updatedCells', 0)} cells in '{sheet_name}'")
         return True
@@ -195,36 +209,32 @@ def main():
 
     sheets_client = GoogleSheetsClient(GOOGLE_CONFIG)
 
-    # Fetch inventory summary (has stock quantities)
-    summary_data = zoho_client.get_inventory_summary()
+    # Probe all endpoints to understand what's available
+    zoho_client.probe_endpoints()
 
-    if summary_data:
-        print(f"\nInventory summary records: {len(summary_data)}")
-        df = pd.DataFrame(summary_data)
-        print(f"Summary columns: {list(df.columns)}")
+    # Fetch items
+    data = zoho_client.get_items()
+    if not data:
+        print("❌ No data fetched — check probe output above for working endpoints")
+        raise SystemExit(1)
 
-        # Keep useful columns
-        keep = ['sku', 'item_name', 'item_id', 'stock_on_hand',
-                'available_stock', 'actual_available_stock',
-                'committed_stock', 'available_for_sale', 'reorder_level']
-        cols = [c for c in keep if c in df.columns]
-        df = df[cols]
+    df = pd.DataFrame(data)
+    print(f"\nTotal records: {len(df)}")
+    print(f"All columns: {list(df.columns)}")
 
-        # Filter stock > 0
-        stock_col = next((c for c in ['stock_on_hand', 'available_stock', 'available_for_sale'] if c in df.columns), None)
-        if stock_col:
-            df = df[pd.to_numeric(df[stock_col], errors='coerce').fillna(0) > 0]
-            print(f"Records with {stock_col} > 0: {len(df)}")
-    else:
-        # Fallback: use items endpoint with all columns
-        print("\n⚠️  No inventory summary data, falling back to items endpoint")
-        items_data = zoho_client.get_items()
-        if not items_data:
-            print("❌ No data fetched")
-            raise SystemExit(1)
-        df = pd.DataFrame(items_data)
-        keep = ['sku', 'item_name', 'reorder_level']
-        df = df[[c for c in keep if c in df.columns]]
+    # Pick columns — use whatever stock fields exist
+    priority_cols = ['sku', 'item_name', 'stock_on_hand', 'available_stock',
+                     'actual_available_stock', 'available_for_sale',
+                     'committed_stock', 'reorder_level']
+    cols = [c for c in priority_cols if c in df.columns]
+    print(f"Using columns: {cols}")
+    df = df[cols]
+
+    # Filter by stock if any stock column present
+    stock_col = next((c for c in ['stock_on_hand', 'available_stock', 'available_for_sale'] if c in df.columns), None)
+    if stock_col:
+        df = df[pd.to_numeric(df[stock_col], errors='coerce').fillna(0) > 0]
+        print(f"After filter ({stock_col} > 0): {len(df)} records")
 
     ist = timezone(timedelta(hours=5, minutes=30))
     df['sync_timestamp'] = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
@@ -234,11 +244,7 @@ def main():
     success = sheets_client.update_sheet(df)
 
     print("\n" + "=" * 60)
-    if success:
-        print(f"✅ SYNC COMPLETED — {len(df)} records written")
-    else:
-        print("❌ SYNC FAILED")
-        raise SystemExit(1)
+    print(f"✅ SYNC COMPLETED — {len(df)} records" if success else "❌ SYNC FAILED")
     print("=" * 60)
 
 if __name__ == "__main__":
