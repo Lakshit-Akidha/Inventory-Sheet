@@ -40,7 +40,7 @@ else:
 
 EXPORT_COLUMNS = [
     'sku', 'item_name',
-    'stock_on_hand', 'available_stock', 'actual_available_stock', 'reorder_level'
+    'stock_on_hand', 'reorder_level'
 ]
 
 MAX_RETRIES = 3
@@ -228,8 +228,8 @@ def main():
     df = df[available_cols]
 
     # Filter to only rows with available stock > 0
-    if 'available_stock' in df.columns:
-        df = df[pd.to_numeric(df['available_stock'], errors='coerce').fillna(0) > 0]
+    if 'stock_on_hand' in df.columns:
+        df = df[pd.to_numeric(df['stock_on_hand'], errors='coerce').fillna(0) > 0]
         print(f"Records with available_stock > 0: {len(df)}")
 
     # Add IST timestamp
