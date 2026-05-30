@@ -41,10 +41,6 @@ MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
 RETRY_DELAY = 15
 
-# ============================================================
-# RETRY HELPER
-# ============================================================
-
 def request_with_retry(method, url, retries=MAX_RETRIES, **kwargs):
     kwargs.setdefault('timeout', REQUEST_TIMEOUT)
     for attempt in range(1, retries + 1):
@@ -55,10 +51,6 @@ def request_with_retry(method, url, retries=MAX_RETRIES, **kwargs):
             if attempt == retries:
                 raise
             time.sleep(RETRY_DELAY)
-
-# ============================================================
-# ZOHO INVENTORY CLIENT
-# ============================================================
 
 class ZohoInventoryClient:
     def __init__(self, config):
@@ -73,47 +65,17 @@ class ZohoInventoryClient:
             'client_secret': self.config['client_secret'],
             'grant_type': 'refresh_token'
         }
-        response = request_with_retry('post', url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            self.access_token = data.get('access_token')
+        r = request_with_retry('post', url, params=params)
+        if r.status_code == 200:
+            self.access_token = r.json().get('access_token')
             if self.access_token:
                 print("✅ Zoho access token refreshed successfully")
                 return True
-            print(f"❌ No access_token in response: {data}")
-            return False
-        print(f"❌ Failed to refresh token: {response.status_code} - {response.text}")
+        print(f"❌ Token refresh failed: {r.text}")
         return False
 
     def get_headers(self):
-        return {
-            'Authorization': f'Zoho-oauthtoken {self.access_token}',
-            'Content-Type': 'application/json'
-        }
-
-    def probe_endpoints(self):
-        """Test multiple endpoints and print what works."""
-        org = self.config['organization_id']
-        base = self.config['api_domain']
-        endpoints = [
-            (f"{base}/inventory/v1/items", 'items'),
-            (f"{base}/inventory/v1/items?filter_by=Status.Active", 'items'),
-            (f"{base}/inventory/v1/inventorysummary", 'inventory_summary'),
-            (f"{base}/inventory/v1/reports/inventorysummary", None),
-            (f"{base}/inventory/v1/warehouses", 'warehouses'),
-        ]
-        print("\n--- Probing Zoho endpoints ---")
-        for url, key in endpoints:
-            r = requests.get(url, headers=self.get_headers(),
-                           params={'organization_id': org, 'page': 1},
-                           timeout=15)
-            body = r.json() if r.headers.get('content-type','').startswith('application/json') else {}
-            code = body.get('code', 'N/A')
-            count = len(body.get(key, [])) if key else '?'
-            print(f"  {r.status_code} code={code} count={count}  {url.replace(base,'')}")
-            if r.status_code == 200 and code == 0 and key and body.get(key):
-                print(f"    Sample keys: {list(body[key][0].keys())[:10]}")
-        print("--- End probe ---\n")
+        return {'Authorization': f'Zoho-oauthtoken {self.access_token}'}
 
     def get_all_pages(self, url, key, extra_params=None):
         all_data = []
@@ -122,37 +84,52 @@ class ZohoInventoryClient:
             params = {'organization_id': self.config['organization_id'], 'page': page}
             if extra_params:
                 params.update(extra_params)
-            response = request_with_retry('get', url, headers=self.get_headers(), params=params)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == 0:
-                    items = data.get(key, [])
-                    if not items:
-                        break
-                    all_data.extend(items)
-                    print(f"   Page {page}: {len(items)} records")
-                    if not data.get('page_context', {}).get('has_more_page', False):
-                        break
-                    page += 1
-                elif data.get('code') == 45:
-                    print(f"🚫 Rate limit. Got {len(all_data)} so far.")
-                    break
-                else:
-                    print(f"❌ API Error code={data.get('code')}: {data.get('message')}")
-                    break
-            else:
-                print(f"❌ HTTP {response.status_code}: {response.text[:200]}")
+            r = request_with_retry('get', url, headers=self.get_headers(), params=params)
+            if r.status_code != 200:
+                print(f"❌ HTTP {r.status_code}: {r.text[:300]}")
                 break
+            data = r.json()
+            if data.get('code') != 0:
+                print(f"❌ API error {data.get('code')}: {data.get('message')}")
+                break
+            items = data.get(key, [])
+            if not items:
+                break
+            all_data.extend(items)
+            print(f"   Page {page}: {len(items)} records")
+            if not data.get('page_context', {}).get('has_more_page', False):
+                break
+            page += 1
         return all_data
 
+    def get_report_keys(self):
+        """Fetch first page of reports/inventorysummary and print all keys."""
+        url = f"{self.config['api_domain']}/inventory/v1/reports/inventorysummary"
+        params = {'organization_id': self.config['organization_id'], 'page': 1}
+        r = request_with_retry('get', url, headers=self.get_headers(), params=params)
+        print(f"\n--- reports/inventorysummary response ---")
+        print(f"Status: {r.status_code}")
+        try:
+            body = r.json()
+            print(f"Top-level keys: {list(body.keys())}")
+            for k, v in body.items():
+                if isinstance(v, list) and v:
+                    print(f"  '{k}' is a list with {len(v)} items. First item keys: {list(v[0].keys())}")
+                    return k, v  # return key name and first page data
+                elif isinstance(v, list):
+                    print(f"  '{k}' is an empty list")
+                else:
+                    print(f"  '{k}': {str(v)[:100]}")
+        except Exception as e:
+            print(f"Could not parse JSON: {e}")
+            print(r.text[:500])
+        print("--- end ---\n")
+        return None, []
+
     def get_items(self):
-        print("Fetching items from Zoho...")
         url = f"{self.config['api_domain']}/inventory/v1/items"
         return self.get_all_pages(url, 'items')
 
-# ============================================================
-# GOOGLE SHEETS CLIENT
-# ============================================================
 
 class GoogleSheetsClient:
     def __init__(self, config):
@@ -193,9 +170,6 @@ class GoogleSheetsClient:
         print(f"✅ Updated {result.get('updatedCells', 0)} cells in '{sheet_name}'")
         return True
 
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     print("=" * 60)
@@ -209,29 +183,49 @@ def main():
 
     sheets_client = GoogleSheetsClient(GOOGLE_CONFIG)
 
-    # Probe all endpoints to understand what's available
-    zoho_client.probe_endpoints()
+    # Step 1: Inspect the reports endpoint to find the right key + columns
+    report_key, _ = zoho_client.get_report_keys()
 
-    # Fetch items
-    data = zoho_client.get_items()
-    if not data:
-        print("❌ No data fetched — check probe output above for working endpoints")
+    # Step 2: Fetch items (always works) and merge with report data if available
+    print("\nFetching items...")
+    items_data = zoho_client.get_items()
+    if not items_data:
+        print("❌ No items fetched")
         raise SystemExit(1)
 
-    df = pd.DataFrame(data)
-    print(f"\nTotal records: {len(df)}")
-    print(f"All columns: {list(df.columns)}")
+    df_items = pd.DataFrame(items_data)
+    print(f"Items fetched: {len(df_items)}")
 
-    # Pick columns — use whatever stock fields exist
-    priority_cols = ['sku', 'item_name', 'stock_on_hand', 'available_stock',
-                     'actual_available_stock', 'available_for_sale',
-                     'committed_stock', 'reorder_level']
-    cols = [c for c in priority_cols if c in df.columns]
-    print(f"Using columns: {cols}")
-    df = df[cols]
+    # Step 3: If report endpoint has a valid key, fetch stock from there and merge
+    if report_key:
+        print(f"\nFetching report data (key='{report_key}')...")
+        url = f"{zoho_client.config['api_domain']}/inventory/v1/reports/inventorysummary"
+        report_data = zoho_client.get_all_pages(url, report_key)
+        if report_data:
+            df_report = pd.DataFrame(report_data)
+            print(f"Report records: {len(df_report)}")
+            print(f"Report columns: {list(df_report.columns)}")
+            # Merge on item_id or sku
+            merge_col = 'item_id' if 'item_id' in df_report.columns else 'sku'
+            if merge_col in df_items.columns and merge_col in df_report.columns:
+                stock_cols = [c for c in df_report.columns if any(x in c for x in
+                    ['stock', 'available', 'committed', 'reorder'])]
+                keep = [merge_col] + stock_cols
+                df_report = df_report[[c for c in keep if c in df_report.columns]]
+                df_items = df_items.merge(df_report, on=merge_col, how='left')
+                print(f"Merged. Stock columns added: {stock_cols}")
 
-    # Filter by stock if any stock column present
-    stock_col = next((c for c in ['stock_on_hand', 'available_stock', 'available_for_sale'] if c in df.columns), None)
+    # Step 4: Select final columns
+    priority = ['sku', 'item_name', 'stock_on_hand', 'available_stock',
+                'actual_available_stock', 'available_for_sale',
+                'committed_stock', 'reorder_level']
+    cols = [c for c in priority if c in df_items.columns]
+    print(f"\nFinal columns: {cols}")
+    df = df_items[cols]
+
+    # Filter by stock > 0
+    stock_col = next((c for c in ['stock_on_hand', 'available_stock', 'available_for_sale']
+                      if c in df.columns), None)
     if stock_col:
         df = df[pd.to_numeric(df[stock_col], errors='coerce').fillna(0) > 0]
         print(f"After filter ({stock_col} > 0): {len(df)} records")
