@@ -20,12 +20,11 @@ ZOHO_CONFIG = {
     'accounts_domain': 'https://accounts.zoho.in'
 }
 
-# Support both file-based and env-var-based Google credentials
 _sa_key_env = os.environ.get('GOOGLE_SA_KEY')
 if _sa_key_env:
     _sa_info = json.loads(_sa_key_env)
     GOOGLE_CONFIG = {
-        'credentials_info': _sa_info,  # dict, used directly
+        'credentials_info': _sa_info,
         'credentials_file': None,
         'spreadsheet_id': os.environ['GOOGLE_SPREADSHEET_ID'],
         'sheet_name': 'inventory-stock'
@@ -35,13 +34,8 @@ else:
         'credentials_info': None,
         'credentials_file': os.environ.get('GOOGLE_CREDENTIALS_FILE', 'google_sa.json'),
         'spreadsheet_id': os.environ['GOOGLE_SPREADSHEET_ID'],
-        'sheet_name': 'Inventory_Stock'
+        'sheet_name': 'inventory-stock'
     }
-
-EXPORT_COLUMNS = [
-    'sku', 'item_name',
-    'stock_on_hand', 'reorder_level'
-]
 
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
@@ -58,10 +52,9 @@ def request_with_retry(method, url, retries=MAX_RETRIES, **kwargs):
             response = requests.request(method, url, **kwargs)
             return response
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            print(f"⚠️  {method.upper()} {url} — Attempt {attempt}/{retries} failed: {e}")
+            print(f"  Attempt {attempt}/{retries} failed: {e}")
             if attempt == retries:
                 raise
-            print(f"   Retrying in {RETRY_DELAY}s...")
             time.sleep(RETRY_DELAY)
 
 # ============================================================
@@ -88,12 +81,10 @@ class ZohoInventoryClient:
             if self.access_token:
                 print("✅ Zoho access token refreshed successfully")
                 return True
-            else:
-                print(f"❌ No access_token in response: {data}")
-                return False
-        else:
-            print(f"❌ Failed to refresh token: {response.status_code} - {response.text}")
+            print(f"❌ No access_token in response: {data}")
             return False
+        print(f"❌ Failed to refresh token: {response.status_code} - {response.text}")
+        return False
 
     def get_headers(self):
         return {
@@ -106,10 +97,7 @@ class ZohoInventoryClient:
         all_data = []
         page = 1
         while True:
-            params = {
-                'organization_id': self.config['organization_id'],
-                'page': page
-            }
+            params = {'organization_id': self.config['organization_id'], 'page': page}
             response = request_with_retry('get', url, headers=self.get_headers(), params=params)
             if response.status_code == 200:
                 data = response.json()
@@ -119,23 +107,20 @@ class ZohoInventoryClient:
                         break
                     all_data.extend(items)
                     print(f"   Page {page}: {len(items)} items fetched")
-                    page_context = data.get('page_context', {})
-                    if not page_context.get('has_more_page', False):
+                    if not data.get('page_context', {}).get('has_more_page', False):
                         break
                     page += 1
                 elif data.get('code') == 45:
-                    print(f"🚫 Zoho rate limit hit on page {page}. Quota exhausted for today.")
-                    print(f"   Returning {len(all_data)} items fetched so far.")
+                    print(f"🚫 Rate limit hit. Returning {len(all_data)} items.")
                     break
                 else:
                     print(f"❌ API Error: {data.get('message')}")
                     break
             elif response.status_code == 429:
-                print(f"🚫 HTTP 429 on page {page}. Quota exhausted.")
-                print(f"   Returning {len(all_data)} items fetched so far.")
+                print(f"🚫 HTTP 429. Returning {len(all_data)} items.")
                 break
             else:
-                print(f"❌ Request failed: {response.status_code} - {response.text}")
+                print(f"❌ Request failed: {response.status_code}")
                 break
         return all_data
 
@@ -152,15 +137,9 @@ class GoogleSheetsClient:
     def _authenticate(self):
         scopes = ['https://www.googleapis.com/auth/spreadsheets']
         if self.config.get('credentials_info'):
-            creds = Credentials.from_service_account_info(
-                self.config['credentials_info'],
-                scopes=scopes
-            )
+            creds = Credentials.from_service_account_info(self.config['credentials_info'], scopes=scopes)
         else:
-            creds = Credentials.from_service_account_file(
-                self.config['credentials_file'],
-                scopes=scopes
-            )
+            creds = Credentials.from_service_account_file(self.config['credentials_file'], scopes=scopes)
         self.service = build('sheets', 'v4', credentials=creds)
         print("✅ Google Sheets authenticated successfully")
 
@@ -168,27 +147,27 @@ class GoogleSheetsClient:
         sheet_name = sheet_name or self.config['sheet_name']
         self.service.spreadsheets().values().clear(
             spreadsheetId=self.config['spreadsheet_id'],
-            range=f"{sheet_name}!A:ZZ"
+            range=f"'{sheet_name}'!A:ZZ"
         ).execute()
         print(f"   Sheet '{sheet_name}' cleared")
 
     def update_sheet(self, data, sheet_name=None):
         sheet_name = sheet_name or self.config['sheet_name']
-        if isinstance(data, pd.DataFrame):
-            data = data.astype(str)
-            values = [data.columns.tolist()] + data.values.tolist()
-        else:
+        if not isinstance(data, pd.DataFrame):
             print("Data must be a DataFrame")
             return False
+        # Replace NaN/inf with empty string to avoid JSON errors
+        data = data.fillna('').replace([float('inf'), float('-inf')], '')
+        data = data.astype(str).replace('nan', '').replace('None', '')
+        values = [data.columns.tolist()] + data.values.tolist()
         body = {'values': values}
         result = self.service.spreadsheets().values().update(
             spreadsheetId=self.config['spreadsheet_id'],
-            range=f"{sheet_name}!A1",
+            range=f"'{sheet_name}'!A1",
             valueInputOption='USER_ENTERED',
             body=body
         ).execute()
-        updated_cells = result.get('updatedCells', 0)
-        print(f"✅ Updated {updated_cells} cells in '{sheet_name}'")
+        print(f"✅ Updated {result.get('updatedCells', 0)} cells in '{sheet_name}'")
         return True
 
 # ============================================================
@@ -201,42 +180,47 @@ def main():
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    # --- Zoho ---
     zoho_client = ZohoInventoryClient(ZOHO_CONFIG)
     if not zoho_client.refresh_access_token():
-        print("❌ Zoho authentication failed. Exiting.")
         raise SystemExit(1)
 
-    # --- Google Sheets ---
     sheets_client = GoogleSheetsClient(GOOGLE_CONFIG)
 
-    # --- Fetch data ---
     print("\nFetching items from Zoho Inventory...")
     data = zoho_client.get_items()
     if not data:
-        print("❌ No data fetched from Zoho")
+        print("❌ No data fetched")
         raise SystemExit(1)
 
     df = pd.DataFrame(data)
     print(f"\nTotal records fetched: {len(df)}")
 
-    # Keep only the columns we need (gracefully handle missing ones)
-    available_cols = [c for c in EXPORT_COLUMNS if c in df.columns]
-    missing_cols = [c for c in EXPORT_COLUMNS if c not in df.columns]
-    if missing_cols:
-        print(f"⚠️  Columns not found in API response (will be skipped): {missing_cols}")
-    df = df[available_cols]
+    # Print available columns for debugging
+    print(f"Available columns: {list(df.columns)}")
 
-    # Filter to only rows with available stock > 0
-    if 'stock_on_hand' in df.columns:
-        df = df[pd.to_numeric(df['stock_on_hand'], errors='coerce').fillna(0) > 0]
-        print(f"Records with available_stock > 0: {len(df)}")
+    # Preferred columns in order — use whatever is available
+    desired = ['sku', 'item_name', 'stock_on_hand', 'available_stock',
+               'actual_available_stock', 'reorder_level']
+    cols = [c for c in desired if c in df.columns]
+    if not cols:
+        # Fallback: just use all columns
+        print("⚠️  None of the desired columns found, writing all columns")
+    else:
+        missing = [c for c in desired if c not in df.columns]
+        if missing:
+            print(f"⚠️  Skipping missing columns: {missing}")
+        df = df[cols]
+
+    # Filter rows where any stock column > 0
+    stock_col = next((c for c in ['stock_on_hand', 'available_stock'] if c in df.columns), None)
+    if stock_col:
+        df = df[pd.to_numeric(df[stock_col], errors='coerce').fillna(0) > 0]
+        print(f"Records with {stock_col} > 0: {len(df)}")
 
     # Add IST timestamp
     ist = timezone(timedelta(hours=5, minutes=30))
     df['sync_timestamp'] = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
-    # --- Write to Sheets ---
     print("\nWriting to Google Sheets...")
     sheets_client.clear_sheet()
     success = sheets_client.update_sheet(df)
